@@ -1,0 +1,165 @@
+name: Deploy Nearest Holiday as Homepage
+
+# ── TRIGGER CONDITIONS ───────────────────────────────────────────────────────
+# Three different trigger types, each demonstrating a different way to kick off
+# the workflow / a different condition style:
+on:
+  schedule:
+    # 1) Time-based condition: runs automatically every day at 00:05 UTC so the
+    #    homepage always reflects "which holiday is nearer" as dates change.
+    - cron: "5 0 * * *"
+  push:
+    # 2) Event-based condition: rebuild whenever the page content changes on main.
+    branches: [main]
+    paths:
+      - "malaysia-day/**"
+      - "malaysia-independence-day/**"
+      - ".github/workflows/deploy-homepage.yml"
+  workflow_dispatch:
+    # 3) Manual condition: lets a human override the auto-detected choice.
+    inputs:
+      target:
+        description: "Force a homepage (skip date logic)"
+        required: true
+        type: choice
+        default: auto
+        options:
+          - auto
+          - merdeka
+          - malaysia-day
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  # ── JOB 1: decide which page wins ─────────────────────────────────────────
+  determine-target:
+    runs-on: ubuntu-latest
+    outputs:
+      target: ${{ steps.pick.outputs.target }}
+    steps:
+      - name: Pick nearer holiday (or honor manual override)
+        id: pick
+        shell: bash
+        run: |
+          set -euo pipefail
+          override="${{ inputs.target }}"
+
+          if [ -n "$override" ] && [ "$override" != "auto" ]; then
+            echo "Manual override in effect: $override"
+            echo "target=$override" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          today=$(date -u +%s)
+          year=$(date -u +%Y)
+
+          # ponytail: naive "nearest by absolute day-diff" scan, good enough for
+          # two fixed dates; if a 3rd holiday is added, generalize into a loop.
+          for label in merdeka malaysia-day; do
+            if [ "$label" = "merdeka" ]; then md="08-31"; else md="09-16"; fi
+            d=$(date -u -d "$year-$md" +%s)
+            # if that date already passed this year, compare against next year's instead
+            if [ "$d" -lt "$today" ]; then
+              d=$(date -u -d "$((year + 1))-$md" +%s)
+            fi
+            diff=$(( (d - today) / 86400 ))
+            echo "$label is $diff day(s) away"
+            eval "${label//-/_}_diff=$diff"
+          done
+
+          if [ "$merdeka_diff" -le "$malaysia_day_diff" ]; then
+            echo "target=merdeka" >> "$GITHUB_OUTPUT"
+          else
+            echo "target=malaysia-day" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ── JOB 2a: build Merdeka page (only runs when it's the chosen target) ────
+  build-merdeka:
+    needs: determine-target
+    if: needs.determine-target.outputs.target == 'merdeka'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Assemble site with Merdeka page as homepage
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp -r malaysia-day malaysia-independence-day dist/
+          cp malaysia-independence-day/index.html dist/index.html
+          sed -i 's#\.\./malaysia-day/#malaysia-day/#; s#\.\./malaysia-independence-day/#malaysia-independence-day/#' dist/index.html
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  # ── JOB 2b: build Malaysia Day page (only runs when it's the chosen target) ─
+  build-malaysia-day:
+    needs: determine-target
+    if: needs.determine-target.outputs.target == 'malaysia-day'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Assemble site with Malaysia Day page as homepage
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp -r malaysia-day malaysia-independence-day dist/
+          cp malaysia-day/index.html dist/index.html
+          sed -i 's#\.\./malaysia-day/#malaysia-day/#; s#\.\./malaysia-independence-day/#malaysia-independence-day/#' dist/index.html
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  # ── JOB 3: deploy — runs only if the job that actually ran, succeeded ─────
+  deploy:
+    needs: [determine-target, build-merdeka, build-malaysia-day]
+    outputs:
+      page_url: ${{ steps.deployment.outputs.page_url }}
+    # if: always() bypasses the default "all needs must succeed" rule so the
+    # ONE build job that was skipped (not selected) doesn't block deployment.
+    # We instead check explicitly that no needed job actually *failed*, and
+    # that at least one build job *succeeded*.
+    if: |
+      always() &&
+      needs.determine-target.result == 'success' &&
+      !contains(needs.*.result, 'failure') &&
+      !contains(needs.*.result, 'cancelled') &&
+      (needs.build-merdeka.result == 'success' || needs.build-malaysia-day.result == 'success')
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
+
+  # ── JOB 4: success notifier — only runs after a real deploy succeeded ─────
+  notify-success:
+    needs: deploy
+    if: success()
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo "✅ Deployed '${{ needs.determine-target.outputs.target }}' as homepage -> ${{ needs.deploy.outputs.page_url }}"
+
+  # ── JOB 5: failure notifier — stops the pipeline's "happy path" and runs
+  #           only when ANY upstream job in this run failed. Add real
+  #           notifications (Slack/email/issue) here later. ────────────────
+  notify-failure:
+    needs: [determine-target, build-merdeka, build-malaysia-day, deploy]
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo "❌ Workflow failed. Job results:"
+          echo "  determine-target: ${{ needs.determine-target.result }}"
+          echo "  build-merdeka:     ${{ needs.build-merdeka.result }}"
+          echo "  build-malaysia-day:${{ needs.build-malaysia-day.result }}"
+          echo "  deploy:            ${{ needs.deploy.result }}"
+          exit 1
